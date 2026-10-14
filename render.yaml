@@ -1,0 +1,25 @@
+# Render Blueprint: one web service (frontend + API) and a PostgreSQL database.
+# Deploy: render.com -> New -> Blueprint -> pick this repo. Pushes to the branch below redeploy automatically.
+services:
+  - type: web
+    name: inclusive-tutor
+    runtime: docker
+    plan: free
+    branch: chatbot-and-animations
+    healthCheckPath: /api/grades
+    envVars:
+      - key: DB_HOST
+        fromDatabase: { name: inclusive-tutor-db, property: host }
+      - key: DB_PORT
+        fromDatabase: { name: inclusive-tutor-db, property: port }
+      - key: DB_NAME
+        fromDatabase: { name: inclusive-tutor-db, property: database }
+      - key: DB_USERNAME
+        fromDatabase: { name: inclusive-tutor-db, property: user }
+      - key: DB_PASSWORD
+        fromDatabase: { name: inclusive-tutor-db, property: password }
+
+databases:
+  - name: inclusive-tutor-db
+    databaseName: adaptive_tutor
+    plan: free
