@@ -5,7 +5,11 @@ the screen line by line, using the browser's built-in voice:
 
 - the line being read gets an outline, the sentence a yellow highlight, and the current word a darker one
 - the page scrolls to follow the reading
-- controls: **Back** / **Pause** / **Next**, speed **Slow / Normal / Fast** (remembered), **Stop** (or Esc)
+- controls: **Back** / **Pause** / **Next**, a **Voice** picker and speed **Slow / Normal / Fast** (both
+  remembered), **Stop** (or Esc)
+- smooth speech: the most natural voice on the device is picked automatically (Edge "Natural" voices, then
+  Google voices in Chrome, preferring Indian English), sentences are queued ahead so they flow without gaps,
+  and headings/buttons get a short natural pause
 - while reading, tap any line of text to read from there
 - it starts from the top of the page, and stops when you go to another page
 - emoji and arrows are skipped instead of being read out ("owl", "rightwards arrow")

@@ -10,8 +10,11 @@ import './read-aloud.css'
 
 const synth = typeof window !== 'undefined' ? window.speechSynthesis : null
 
-const SPEEDS = { slow: 0.75, normal: 0.9, fast: 1.1 }
+const SPEEDS = { slow: 0.8, normal: 0.95, fast: 1.15 }
 const SPEED_KEY = 'read-aloud-speed'
+const VOICE_KEY = 'read-aloud-voice'
+// Sentences handed to the speech engine ahead of time, so one flows into the next without a gap.
+const LOOKAHEAD = 3
 const ROOT_SELECTOR = '#root'
 const BLOCK_DISPLAYS = new Set(['block', 'flex', 'grid', 'list-item', 'table-cell', 'table-caption', 'flow-root'])
 const BLOCK_TAGS = new Set(['BUTTON', 'LABEL', 'A', 'SUMMARY'])
@@ -59,7 +62,7 @@ function collectLines() {
     if (!lines.has(el)) lines.set(el, [])
     lines.get(el).push(node)
   }
-  return [...lines].map(([el, nodes]) => ({ el, nodes, parsed: null }))
+  return [...lines].map(([el, nodes]) => ({ el, nodes, parsed: null, top: 0 }))
 }
 
 /** Joins a line's text nodes into one string and splits it into sentences, keeping node offsets for highlighting. */
@@ -116,14 +119,57 @@ function rangeFor({ segs }, start, end) {
   }
 }
 
+// ------------------------------------------------------------------ choosing a natural voice
+
+let voices = []
+
+/** Higher is more natural: neural "Natural"/"Online" voices (Edge) and Google voices (Chrome) beat desktop ones. */
+function voiceScore(v) {
+  let score = 0
+  if (/natural/i.test(v.name)) score += 100
+  if (/online/i.test(v.name)) score += 40
+  if (/^google/i.test(v.name)) score += 60
+  if (!v.localService) score += 10
+  if (/^en-IN/i.test(v.lang)) score += 20
+  else if (/^en-(GB|US)/i.test(v.lang)) score += 10
+  if (/^en/i.test(v.lang)) score += 5
+  return score
+}
+
+function loadVoices() {
+  const all = synth.getVoices()
+  const english = all.filter((v) => /^en/i.test(v.lang))
+  voices = (english.length ? english : all).slice().sort((a, b) => voiceScore(b) - voiceScore(a))
+  renderVoices()
+}
+
+function savedVoiceName() {
+  try { return localStorage.getItem(VOICE_KEY) } catch { return null }
+}
+
+function currentVoice() {
+  const name = savedVoiceName()
+  return voices.find((v) => v.name === name) || voices[0] || null
+}
+
+/** "Microsoft Aria Online (Natural) - English (United States)" -> "Aria · Natural (US)" */
+function voiceLabel(v) {
+  const region = { 'en-IN': 'India', 'en-GB': 'UK', 'en-US': 'US', 'en-AU': 'Australia', 'en-CA': 'Canada' }[v.lang] || v.lang
+  const name = v.name.replace(/^(Microsoft|Google)\s+/i, '').replace(/\s*-\s*English.*$/i, '')
+    .replace(/\s*Online\s*\(Natural\)/i, ' · Natural').replace(/\s*\(Natural\)/i, ' · Natural')
+  return `${name} (${region})`
+}
+
 // ------------------------------------------------------------------ the reader
 
 const state = {
   active: false,
   paused: false,
   lines: [],
-  li: 0, // current line
-  si: 0, // current sentence in that line
+  li: 0, // line being spoken
+  si: 0, // sentence being spoken in that line
+  queued: null, // next position to hand to the speech engine
+  inFlight: 0,
   token: 0,
   path: '',
   current: null,
@@ -179,60 +225,104 @@ function markWord(line, sentence, charIndex, charLength) {
 /** Silences our own speech without treating it as someone else interrupting. */
 function silence() {
   state.token++
+  state.inFlight = 0
+  state.queued = null
   synth.cancel()
-}
-
-function speakCurrent() {
-  if (!state.active || state.paused) return
-  if (location.pathname !== state.path) return stop()
-
-  // Skip lines with nothing to say; recover if the page re-rendered under us.
-  for (;;) {
-    if (state.li >= state.lines.length) return finish()
-    const line = state.lines[state.li]
-    if (!line.el.isConnected || !line.nodes.every((n) => n.isConnected)) {
-      const y = line.top ?? 0
-      state.lines = collectLines()
-      state.li = Math.max(0, state.lines.findIndex((l) => absTop(l.el) >= y))
-      if (state.li < 0 || !state.lines.length) return finish()
-      state.si = 0
-      continue
-    }
-    line.parsed ??= parse(line)
-    line.top = absTop(line.el)
-    if (state.si < line.parsed.sentences.length) break
-    state.li++
-    state.si = 0
-  }
-
-  const line = state.lines[state.li]
-  const sentence = line.parsed.sentences[state.si]
-  markLine(line, sentence)
-  render()
-
-  const token = ++state.token
-  const u = new SpeechSynthesisUtterance(line.parsed.spoken.slice(sentence.start, sentence.end))
-  u.rate = SPEEDS[speed]
-  u.onboundary = (e) => {
-    if (token === state.token && (!e.name || e.name === 'word')) markWord(line, sentence, e.charIndex, e.charLength)
-  }
-  u.onend = () => {
-    if (token !== state.token) return
-    state.si++
-    speakCurrent()
-  }
-  u.onerror = (e) => {
-    if (token !== state.token) return
-    // Another speak button on the page took over the voice: step aside.
-    if (e.error === 'interrupted' || e.error === 'canceled') return stop()
-    state.si++
-    speakCurrent()
-  }
-  synth.speak(u)
 }
 
 function absTop(el) {
   return el.getBoundingClientRect().top + window.scrollY
+}
+
+/** The first sentence at or after (li, si) that has something to say, or null at the end of the screen. */
+function normalize(li, si) {
+  while (li < state.lines.length) {
+    const line = state.lines[li]
+    if (!line.parsed) {
+      line.parsed = parse(line)
+      line.top = line.el.isConnected ? absTop(line.el) : 0
+    }
+    if (si < line.parsed.sentences.length) return { li, si }
+    li++
+    si = 0
+  }
+  return null
+}
+
+function after({ li, si }) {
+  return normalize(li, si + 1)
+}
+
+/** Starts speaking from a position, queueing a few sentences ahead for gap-free speech. */
+function speakFrom(pos) {
+  silence()
+  if (!pos) return finish()
+  state.li = pos.li
+  state.si = pos.si
+  state.queued = pos
+  fill(state.token)
+  render()
+}
+
+function fill(token) {
+  while (token === state.token && state.queued && state.inFlight < LOOKAHEAD) {
+    const pos = state.queued
+    state.queued = after(pos)
+    state.inFlight++
+    enqueue(pos, token, state.queued === null)
+  }
+}
+
+function enqueue(pos, token, last) {
+  const line = state.lines[pos.li]
+  const sentence = line.parsed.sentences[pos.si]
+  let text = line.parsed.spoken.slice(sentence.start, sentence.end)
+  // Headings, labels and buttons have no full stop; adding one gives a natural falling tone and a short pause.
+  if (!/[.!?:;]["')\]]*$/.test(text)) text += '.'
+
+  const u = new SpeechSynthesisUtterance(text)
+  const voice = currentVoice()
+  if (voice) {
+    u.voice = voice
+    u.lang = voice.lang
+  }
+  u.rate = SPEEDS[speed]
+  u.pitch = 1
+
+  u.onstart = () => {
+    if (token !== state.token) return
+    if (location.pathname !== state.path) return stop()
+    if (!line.el.isConnected || !line.nodes.every((n) => n.isConnected)) return recover(line)
+    state.li = pos.li
+    state.si = pos.si
+    markLine(line, sentence)
+    render()
+  }
+  u.onboundary = (e) => {
+    if (token === state.token && (!e.name || e.name === 'word')) markWord(line, sentence, e.charIndex, e.charLength)
+  }
+  const done = () => {
+    if (token !== state.token) return
+    state.inFlight--
+    if (last && state.inFlight <= 0) return finish()
+    fill(token)
+  }
+  u.onend = done
+  u.onerror = (e) => {
+    if (token !== state.token) return
+    // Another speak button on the page took over the voice: step aside.
+    if (e.error === 'interrupted' || e.error === 'canceled') return stop()
+    done()
+  }
+  synth.speak(u)
+}
+
+/** The page re-rendered under us (e.g. a new chat message): re-read the screen and carry on from the same place. */
+function recover(line) {
+  const y = line.top
+  state.lines = collectLines()
+  const idx = state.lines.findIndex((l) => absTop(l.el) >= y - 1)
+  speakFrom(idx < 0 ? null : normalize(idx, 0))
 }
 
 function start(fromEl) {
@@ -243,12 +333,10 @@ function start(fromEl) {
   state.path = location.pathname
   state.active = true
   state.paused = false
-  state.si = 0
   // From the top of the page, or from the line the student tapped.
-  state.li = fromEl ? Math.max(0, lines.findIndex((l) => l.el === fromEl)) : 0
+  const li = fromEl ? Math.max(0, lines.findIndex((l) => l.el === fromEl)) : 0
   document.addEventListener('click', onPageClick, true)
-  speakCurrent()
-  render()
+  speakFrom(normalize(li, 0))
 }
 
 function stop() {
@@ -272,32 +360,37 @@ function togglePause() {
     silence() // pause() is unreliable across browsers; resuming re-reads the current sentence instead.
     render()
   } else {
-    speakCurrent()
+    speakFrom({ li: state.li, si: state.si })
   }
 }
 
 function step(delta) {
   if (!state.active) return
-  silence()
-  const line = state.lines[state.li]
-  // "Back" first returns to the start of the current line, like a music player.
-  if (delta < 0 && state.si > 0) state.si = 0
-  else {
-    state.li = Math.min(Math.max(state.li + delta, 0), state.lines.length - 1)
-    state.si = 0
-  }
-  if (!line) return
   state.paused = false
-  speakCurrent()
+  // "Back" first returns to the start of the current line, like a music player.
+  if (delta < 0 && state.si > 0) return speakFrom({ li: state.li, si: 0 })
+  let li = state.li + delta
+  if (delta < 0) {
+    while (li > 0 && !normalize(li, 0)) li--
+    return speakFrom(normalize(Math.max(li, 0), 0))
+  }
+  speakFrom(normalize(li, 0))
+}
+
+/** Speed or voice changed: carry on from the current sentence with the new setting. */
+function restartCurrent() {
+  if (state.active && !state.paused) speakFrom({ li: state.li, si: state.si })
 }
 
 function setSpeed(value) {
   speed = value
   try { localStorage.setItem(SPEED_KEY, value) } catch { /* private mode: keep it for this visit only */ }
-  if (state.active && !state.paused) {
-    silence()
-    speakCurrent()
-  }
+  restartCurrent()
+}
+
+function setVoice(name) {
+  try { localStorage.setItem(VOICE_KEY, name) } catch { /* private mode */ }
+  restartCurrent()
 }
 
 /** While reading, clicking any line of text (not a button or field) reads from that line. */
@@ -335,7 +428,9 @@ function mount() {
   const back = el('button', { type: 'button', class: 'ra-btn', 'aria-label': 'Previous line' }, '⏮<span>Back</span>')
   const pause = el('button', { type: 'button', class: 'ra-btn ra-main' })
   const next = el('button', { type: 'button', class: 'ra-btn', 'aria-label': 'Next line' }, '<span>Next</span>⏭')
-  const speedSel = el('select', { class: 'ra-speed', 'aria-label': 'Reading speed' },
+  const settings = el('div', { class: 'ra-settings' })
+  const voiceSel = el('select', { class: 'ra-select ra-voice', 'aria-label': 'Voice' })
+  const speedSel = el('select', { class: 'ra-select', 'aria-label': 'Reading speed' },
     '<option value="slow">Slow</option><option value="normal">Normal</option><option value="fast">Fast</option>')
   const fab = el('button', { type: 'button', class: 'ra-fab' })
 
@@ -344,20 +439,38 @@ function mount() {
   next.onclick = () => step(1)
   pause.onclick = togglePause
   speedSel.onchange = () => setSpeed(speedSel.value)
+  voiceSel.onchange = () => setVoice(voiceSel.value)
   fab.onclick = () => (state.active ? stop() : start())
 
-  controls.append(back, pause, next, speedSel)
-  panel.append(status, controls)
+  controls.append(back, pause, next)
+  settings.append(voiceSel, speedSel)
+  panel.append(status, controls, settings)
   widget.append(panel, fab)
   document.body.append(widget)
-  ui = { panel, status, pause, fab }
+  ui = { panel, status, pause, fab, voiceSel }
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && state.active) stop()
   })
-  // Leaving the page (or the app navigating to another screen) ends the reading.
   window.addEventListener('pagehide', () => synth.cancel())
+  // Voices load asynchronously in most browsers.
+  loadVoices()
+  synth.addEventListener?.('voiceschanged', loadVoices)
   render()
+}
+
+function renderVoices() {
+  if (!ui) return
+  const chosen = currentVoice()
+  ui.voiceSel.innerHTML = ''
+  voices.forEach((v) => {
+    const opt = document.createElement('option')
+    opt.value = v.name
+    opt.textContent = voiceLabel(v)
+    ui.voiceSel.append(opt)
+  })
+  if (chosen) ui.voiceSel.value = chosen.name
+  ui.voiceSel.hidden = voices.length < 2
 }
 
 function setStatus(text) {
